@@ -34,17 +34,6 @@ class BoundBox:
             else:
                 return min(x2,x4) - x3
 
-class WeightReader:
-    def __init__(self, weight_file):
-        self.offset = 4
-        self.all_weights = np.fromfile(weight_file, dtype='float32')
-
-    def read_bytes(self, size):
-        self.offset = self.offset + size
-        return self.all_weights[self.offset-size:self.offset]
-
-    def reset(self):
-        self.offset = 4
 
 def interpret_netout(image, netout):
     boxes = []
@@ -64,7 +53,7 @@ def interpret_netout(image, netout):
                 box.h = ANCHORS[2 * b + 1] * np.exp(box.h) / GRID_H
                 box.c = sigmoid(box.c)
 
-                # last 20 weights for class likelihoods
+                # rest of weights for class likelihoods
                 classes = netout[row,col,b,5:]
                 box.probs = softmax(classes) * box.c
                 box.probs *= box.probs > THRESHOLD
@@ -87,10 +76,14 @@ def interpret_netout(image, netout):
                     if boxes[index_i].iou(boxes[index_j]) >= 0.4:
                         boxes[index_j].probs[c] = 0
 
+    print("Number of initial boxes: {}".format(len(boxes)))
+
     # draw the boxes using a threshold
     for box in boxes:
         max_indx = np.argmax(box.probs)
         max_prob = box.probs[max_indx]
+        print("Highest box probability for box: {}".format(max_prob))
+
 
         if max_prob > THRESHOLD:
             xmin  = int((box.x - box.w/2) * image.shape[1])
@@ -99,8 +92,8 @@ def interpret_netout(image, netout):
             ymax  = int((box.y + box.h/2) * image.shape[0])
 
 
-            cv2.rectangle(image, (xmin,ymin), (xmax,ymax), COLORS[max_indx], 2)
-            cv2.putText(image, LABELS[max_indx], (xmin, ymin - 12), 0, 1e-3 * image.shape[0], (0,255,0), 2)
+            cv2.rectangle(image, (xmin,ymin), (xmax,ymax), (0,0,0), 2)
+            cv2.putText(image, labels[max_indx], (xmin, ymin - 12), 0, 1e-3 * image.shape[0], (0,255,0), 2)
 
     return image
 
@@ -113,9 +106,10 @@ def read_imagenet_labels(label_file):
     return labels
 
 
-def parse_annotation(ann_dir, label_type="pascal"):
+def parse_annotation(ann_dir):
     img_anns = []
     classes = set()
+    label_mapping = read_imagenet_labels(LABEL_FILE)
 
     for ann in os.listdir(ann_dir):
         img = {'object':[]}
@@ -137,19 +131,11 @@ def parse_annotation(ann_dir, label_type="pascal"):
                     if 'name' in attr.tag:
                         obj['name'] = attr.text
 
-                        if label_type is "pascal":
-                            if obj['name'] in LABELS:
-                                img['object'] += [obj]
-                            else:
-                                break
-
-                        if label_type is "imagenet":
-                            classes.add(obj['name'])
-                            # add additional label if class label available
-                            if obj['name'] in IMAGENET_LABELS:
-                                obj['class'] = IMAGENET_LABELS[obj['name']]
-                            img['object'] += [obj]
-
+                        classes.add(obj['name'])
+                        # add additional label if class label available
+                        if obj['name'] in label_mapping:
+                            obj['class'] = label_mapping[obj['name']]
+                        img['object'] += [obj]
 
                     if 'bndbox' in attr.tag:
                         for dim in list(attr):
@@ -162,18 +148,14 @@ def parse_annotation(ann_dir, label_type="pascal"):
                             if 'ymax' in dim.tag:
                                 obj['ymax'] = int(round(float(dim.text)))
 
-    if label_type is "imagenet":
-        print("Number of classes present in this ImageNet set: {}".format(len(classes)))
-        return img_anns, list(classes)
+    print("Number of classes present in this ImageNet set: {}".format(len(classes)))
+    return img_anns, list(classes)
 
-    return img_anns
 
-def aug_img(train_instance, task):
+def aug_img(train_instance):
     path = train_instance['filename']
     all_obj = copy.deepcopy(train_instance['object'][:])
-    file_dir = imagenet_img_dir if task is "imagenet" else img_dir
-    file_path = path + ".JPEG" if task is "imagenet" else path
-    img = cv2.imread(file_dir + file_path)
+    img = cv2.imread(img_dir + path + ".JPEG")
     h, w, c = img.shape
 
     # scale the image
@@ -223,7 +205,7 @@ def aug_img(train_instance, task):
 
     return img, all_obj
 
-def data_gen(img_anns, label_list, num_class, batch_size, task="pascal"):
+def data_gen(img_anns, batch_size):
     num_img = len(img_anns)
     shuffled_indices = np.random.permutation(np.arange(num_img))
     l_bound = 0
@@ -238,13 +220,13 @@ def data_gen(img_anns, label_list, num_class, batch_size, task="pascal"):
         batch_size = r_bound - l_bound
         currt_inst = 0
         x_batch = np.zeros((batch_size, NORM_W, NORM_H, 3))
-        y_batch = np.zeros((batch_size, GRID_W, GRID_H, BOX, 5+num_class))
+        y_batch = np.zeros((batch_size, GRID_W, GRID_H, BOX, 5+CLASS))
 
         for index in shuffled_indices[l_bound:r_bound]:
             train_instance = img_anns[index]
 
             # augment input image and fix object's position and size
-            img, all_obj = aug_img(train_instance, task)
+            img, all_obj = aug_img(train_instance)
             #for obj in all_obj:
             #    cv2.rectangle(img[:,:,::-1], (obj['xmin'],obj['ymin']), (obj['xmax'],obj['ymax']), (1,1,0), 3)
             #plt.imshow(img); plt.show()
@@ -261,13 +243,13 @@ def data_gen(img_anns, label_list, num_class, batch_size, task="pascal"):
                 grid_y = int(np.floor(center_y))
 
                 if grid_x < GRID_W and grid_y < GRID_H:
-                    obj_indx = label_list.index(obj['name'])
+                    obj_idx = labels.index(obj['name'])
                     box = [obj['xmin'], obj['ymin'], obj['xmax'], obj['ymax']]
 
                     y_batch[currt_inst, grid_y, grid_x, :, 0:4]        = BOX * [box]
                     y_batch[currt_inst, grid_y, grid_x, :, 4  ]        = BOX * [1.]
-                    y_batch[currt_inst, grid_y, grid_x, :, 5: ]        = BOX * [[0.]*num_class]
-                    y_batch[currt_inst, grid_y, grid_x, :, 5+obj_indx] = 1.0
+                    y_batch[currt_inst, grid_y, grid_x, :, 5: ]        = BOX * [[0.]*CLASS]
+                    y_batch[currt_inst, grid_y, grid_x, :, 5+obj_idx] = 1.0
 
             # concatenate batch input from the image
             x_batch[currt_inst] = img
